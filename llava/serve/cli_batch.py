@@ -12,6 +12,7 @@ from PIL import Image
 
 import pandas as pd
 import glob
+from tqdm import tqdm
 
 def main(args):
     # Model
@@ -41,7 +42,7 @@ def main(args):
 
     file_names=[]
     texts=[]
-    for path in paths:
+    for path in tqdm(paths):
         image = Image.open(path)
 
         # Check if the image has an alpha (transparency) channel
@@ -77,7 +78,7 @@ def main(args):
         if args.debug:
             print("\n", {"outputs": outputs}, "\n")
 
-    pd.DataFrame({"file_name":file_names,"text":texts}).to_csv(args.output_file,index=False)
+    pd.DataFrame({"file_name":file_names,"text":texts}).to_csv(args.output_csv,index=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

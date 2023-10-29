@@ -40,6 +40,7 @@ def main(args):
     paths += glob.glob(os.path.join(args.image_folder,"*.jpeg"))
     paths +=  glob.glob(os.path.join(args.image_folder,"*.webp"))
 
+    prompt=args.system_prompt+" USER: <image>\n"+args.user_prompt+"\nASSISTANT:"
     file_names=[]
     texts=[]
     for path in tqdm(paths):
@@ -59,7 +60,7 @@ def main(args):
 
         # prompt = "このイラストを日本語でできる限り詳細に説明してください。表情や髪の色、目の色、耳の種類、服装、服の色など注意して説明してください。説明は反復を避けてください。"
 
-        input_ids = tokenizer_image_token(args.prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
 
         with torch.inference_mode():
             output_ids = model.generate(
@@ -71,7 +72,7 @@ def main(args):
             )
 
         outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
-
+        outputs = outputs.split("assistant:")[-1]
         texts.append(outputs)
         file_names.append(path.split("/")[-1])
 
@@ -86,7 +87,8 @@ if __name__ == "__main__":
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--image-folder", type=str, required=True)
     parser.add_argument("--output-csv", type=str, required=True)
-    parser.add_argument("--prompt", type=str, required=True)
+    parser.add_argument("--system-prompt", type=str, required=True)
+    parser.add_argument("--user-prompt", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)

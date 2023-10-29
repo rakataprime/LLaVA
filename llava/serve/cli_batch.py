@@ -72,7 +72,7 @@ def main(args):
             )
 
         outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
-        outputs = outputs.split("assistant:")[-1]
+
         texts.append(outputs)
         file_names.append(path.split("/")[-1])
 

@@ -88,8 +88,20 @@ class KeywordsStoppingCriteria(StoppingCriteria):
         self.tokenizer = tokenizer
         self.start_len = input_ids.shape[1]
 
-    def __call__(self, output_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
-        assert output_ids.shape[0] == 1, "Only support batch size 1 (yet)"  # TODO
+    # def __call__(self, output_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+    #     assert output_ids.shape[0] == 1, "Only support batch size 1 (yet)"  # TODO
+    #     offset = min(output_ids.shape[1] - self.start_len, self.max_keyword_len)
+    #     self.keyword_ids = [keyword_id.to(output_ids.device) for keyword_id in self.keyword_ids]
+    #     for keyword_id in self.keyword_ids:
+    #         if (output_ids[0, -keyword_id.shape[0]:] == keyword_id).all():
+    #             return True
+    #     outputs = self.tokenizer.batch_decode(output_ids[:, -offset:], skip_special_tokens=True)[0]
+    #     for keyword in self.keywords:
+    #         if keyword in outputs:
+    #             return True
+    #     return False
+    
+    def call_for_batch(self, output_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
         offset = min(output_ids.shape[1] - self.start_len, self.max_keyword_len)
         self.keyword_ids = [keyword_id.to(output_ids.device) for keyword_id in self.keyword_ids]
         for keyword_id in self.keyword_ids:
@@ -100,3 +112,9 @@ class KeywordsStoppingCriteria(StoppingCriteria):
             if keyword in outputs:
                 return True
         return False
+
+    def __call__(self, output_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        outputs = []
+        for i in range(output_ids.shape[0]):
+            outputs.append(self.call_for_batch(output_ids[i].unsqueeze(0), scores))
+        return all(outputs)

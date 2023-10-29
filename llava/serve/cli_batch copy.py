@@ -43,7 +43,6 @@ def main(args):
     prompt="USER: <image>\n"+args.user_prompt+"\nASSISTANT:"
     file_names=[]
     texts=[]
-    image_tensors=[]
     for path in tqdm(paths):
         image = Image.open(path)
 
@@ -57,40 +56,28 @@ def main(args):
 
         # Similar operation in model_worker.py
         image_tensor = process_images([image], image_processor, args)
-        image_tensors.append(image_tensor)
+        image_tensor = image_tensor.to(model.device, dtype=torch.float16)
 
-    print(image_tensor.size())
-    image_tensor = torch.cat(image_tensors, 0)
-    print(image_tensor.size())
-    image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+        # prompt = "このイラストを日本語でできる限り詳細に説明してください。表情や髪の色、目の色、耳の種類、服装、服の色など注意して説明してください。説明は反復を避けてください。"
 
-    # prompt = "このイラストを日本語でできる限り詳細に説明してください。表情や髪の色、目の色、耳の種類、服装、服の色など注意して説明してください。説明は反復を避けてください。"
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
 
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-    print("input_ids",input_ids,  input_ids.size())
-    # input_ids=input_ids.repeat(15,0)
-    # input_ids=torch.cat([input_ids,input_ids],0)
-    input_ids= torch.repeat_interleave(input_ids, repeats=image_tensor.size()[0], dim=0)
-    print("input_ids",input_ids,  input_ids.size())
+        with torch.inference_mode():
+            output_ids = model.generate(
+                input_ids,
+                images=image_tensor,
+                do_sample=True,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens,
+            )
 
+        outputs = tokenizer.decode(output_ids[0, input_ids.shape[1]:]).strip()
 
-    with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor,
-            do_sample=True,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-        )
-    print("output_ids",output_ids.size())
-    for a in range(output_ids.size()[0]):
-        outputs = tokenizer.decode(output_ids[a, input_ids.shape[1]:]).strip()
-        print(outputs)
         texts.append(outputs)
-        file_names.append(paths[a].split("/")[-1])
+        file_names.append(path.split("/")[-1])
 
-    if args.debug:
-        print("\n", {"outputs": outputs}, "\n")
+        if args.debug:
+            print("\n", {"outputs": outputs}, "\n")
 
     pd.DataFrame({"file_name":file_names,"text":texts}).to_csv(args.output_csv,index=False)
 
@@ -121,11 +108,11 @@ if __name__ == "__main__":
 # --output-csv '/mnt/NVM/test/metadata.csv'
 
 
-# python -m llava.serve.cli_batch --model-path '/mnt/sabrent/llava-v1.5-7b' \ 
-# --load-4bit \
-# --max-new-tokens 128 \
-# --user-prompt 'describe this image and its style in a highly detailed manner' \
-# --image-folder '/home/logan/ldb/r2'  \
-# --output-csv '/home/logan/thumperai/test.csv'
+python -m llava.serve.cli_batch --model-path '/mnt/sabrent/llava-v1.5-7b' \ 
+--load-4bit \
+--max-new-tokens 128 \
+--user-prompt 'describe this image and its style in a highly detailed manner' \
+--image-folder '/home/logan/ldb/r2'  \
+--output-csv '/home/logan/thumperai/test.csv'
 
 # 15images

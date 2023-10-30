@@ -6,17 +6,191 @@ import torch
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.model.builder import load_pretrained_model
 from llava.utils import disable_torch_init
-from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+from llava.mm_utils import process_images, tokenizer_image_token, get_model_name_from_path
+from llava.conversation import conv_templates
 
 from PIL import Image
-
 import pandas as pd
 import glob
 from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+import math
+
+
+def split_list(lst, n):
+    """Split a list into n (roughly) equal-sized chunks"""
+    chunk_size = math.ceil(len(lst) / n)  # integer division
+    return [lst[i:i+chunk_size] for i in range(0, len(lst), chunk_size)]
+
+
+def get_chunk(lst, n, k):
+    chunks = split_list(lst, n)
+    return chunks[k]
+
+
+# Custom dataset class
+class CustomDataset(Dataset):
+    def __init__(self, questions, image_folder, tokenizer, image_processor, model_config):
+        self.questions = questions
+        self.image_folder = image_folder
+        self.tokenizer = tokenizer
+        self.image_processor = image_processor
+        self.model_config = model_config
+
+    def __getitem__(self, index):
+
+        
+        line = self.questions[index]
+        image_file = line["image"]
+        qs = line["text"]
+        if self.model_config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+
+        conv = conv_templates[args.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs)
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        image = Image.open(os.path.join(self.image_folder, image_file)).convert('RGB')
+        image_tensor = process_images([image], self.image_processor, self.model_config)[0]
+
+        input_ids = tokenizer_image_token(prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').squeeze(0)
+
+        return input_ids, image_tensor
+
+    def __len__(self):
+        return len(self.questions)
+
+
+# DataLoader
+def create_data_loader(questions, image_folder, tokenizer, image_processor, model_config, batch_size=1, num_workers=4):
+    assert batch_size == 1, "batch_size must be 1"
+    dataset = CustomDataset(questions, image_folder, tokenizer, image_processor, model_config)
+    data_loader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+    return data_loader
+
+class LlavaCaptionDataset(Dataset):
+    """LLava for captioning inference dataset."""
+    def __init__(self, prompt, paths, tokenizer, image_processor):
+        """
+        Arguments:
+            npy_file (string): Path to the csv file with annotations.
+            root_dir (string): Directory with all the images.
+            transform (callable, optional): Optional transform to be applied
+                on a sample.
+        """
+        self.paths = paths
+        self.idx = 0
+        self.prompt =prompt
+        self.image_processor = image_processor
+        self.tokenizer= tokenizer
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        path = self.paths[self.idx]
+        self.idx+=1
+        image = Image.open(path)
+        # Check if the image has an alpha (transparency) channel
+        if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+            # Create a new white background image
+            background = Image.new('RGB', image.size, (255, 255, 255))
+            # Paste the image onto the background using the alpha channel as a mask
+            background.paste(image, (0, 0), image)
+
+        # Similar operation in model_worker.py
+        image_tensor = process_images([image], self.image_processor, args)#.squeeze(0)
+        image_tensor = image_tensor.to(torch.float16)
+
+        input_ids = tokenizer_image_token(self.prompt, self.tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt') #.unsqueeze(0)
+
+        sample = {'image_tensor': image_tensor, 'input_ids': input_ids, 'path':path}
+        # if self.transform:
+        #     sample = self.transform(sample)
+        return sample
+
+
+# class ToTensor(object):
+#     """Convert ndarrays in sample to Tensors."""
+#     def __call__(self, sample):
+#         image_tensor, input_ids = sample['image_tensor'], sample['input_ids']
+#         # swap color axis because
+#         # numpy image: H x W x C
+#         # torch image: C x H x W
+#         # image = image.transpose((2, 0, 1))
+#         return {'image_tensor': torch.from_numpy(image_tensor),
+#                 'input_ids': input_idstorch.from_numpy(input_ids)}
+
+def generate_texts(args, paths, model, tokenizer, image_processor, prompt, start_index, end_index):
+    file_names=[]
+    texts=[]
+    image_tensors=[]
+    for path in paths[start_index:end_index]:
+        image = Image.open(path)
+
+        # Check if the image has an alpha (transparency) channel
+        if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
+            # Create a new white background image
+            background = Image.new('RGB', image.size, (255, 255, 255))
+
+            # Paste the image onto the background using the alpha channel as a mask
+            background.paste(image, (0, 0), image)
+
+        # Similar operation in model_worker.py
+        image_tensor = process_images([image], image_processor, args)
+        image_tensors.append(image_tensor)
+
+    image_tensor = torch.cat(image_tensors, 0)
+    image_tensor = image_tensor.to(model.device, dtype=torch.float16)
+
+    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+    input_ids = torch.repeat_interleave(input_ids, repeats=image_tensor.size()[0], dim=0)
+
+    with torch.inference_mode():
+        output_ids = model.generate(
+            input_ids,
+            images=image_tensor,
+            do_sample=True,
+            temperature=args.temperature,
+            max_new_tokens=args.max_new_tokens
+        )
+
+    for a in range(output_ids.size()[0]):
+        outputs = tokenizer.decode(output_ids[a, input_ids.shape[1]:],skip_special_tokens=True).strip()
+        texts.append(outputs)
+        file_names.append(os.path.basename(paths[start_index+a]))
+
+    if args.debug:
+        print("\n", {"outputs": outputs}, "\n")
+
+    return file_names,texts
+
+
+# def upload_file(client, bucket,key, filepath= None):
+#     if filepath is None:
+#         fo = io.BytesIO(b'my data stored as file object in RAM')
+#         client.upload_fileobj(fo, bucket, key)
+#     else:
+#         client.upload_file(filepath, bucket, os.path.basename(filepath)
+#                            ) 
+        
+# client = boto3.client('s3',  endpoint_url= os.environ.get("BUCKET_URL", "https://.r2.cloudflarestorage.com"), 
+#                                        aws_access_key_id= os.environ.get("ACCESS_KEY_ID", ""),
+#                                        aws_secret_access_key= os.environ.get("SECRET_ACCESS_KEY", ""),
+#                                        region_name= os.environ.get("BUCKET_REGION", "auto"))
+
+# @ray.remote(ngpu=1)
+# def generate_caption_data(input_file):
+#     client = s3_client()
+#   client.download_file( args["checkpoint_filename"], f"{model_dir}/{args['checkpoint_filename']}")
 
 def main(args):
     # Model
     disable_torch_init()
+    # torch.cuda.empty_cache()
 
     model_name = get_model_name_from_path(args.model_path)
     tokenizer, model, image_processor, context_len = load_pretrained_model(args.model_path, args.model_base, model_name, args.load_8bit, args.load_4bit, device=args.device)
@@ -35,64 +209,51 @@ def main(args):
     else:
         args.conv_mode = conv_mode
 
+    conv = conv_templates[args.conv_mode].copy()
+
     paths = glob.glob(os.path.join(args.image_folder,"*.png"))
     paths += glob.glob(os.path.join(args.image_folder,"*.jpg"))
     paths += glob.glob(os.path.join(args.image_folder,"*.jpeg"))
-    paths +=  glob.glob(os.path.join(args.image_folder,"*.webp"))
-    # prompt=args.system_prompt+" USER: <image>\n"+args.user_prompt+"\nASSISTANT:"
-    prompt="USER: <image>\n"+args.user_prompt+"\nASSISTANT:"
+    paths += glob.glob(os.path.join(args.image_folder,"*.webp"))
+
+    # first message
+    if model.config.mm_use_im_start_end:
+        user_input = DEFAULT_IM_START_TOKEN+DEFAULT_IMAGE_TOKEN+DEFAULT_IM_END_TOKEN+"\n"+args.user_prompt
+    else:
+        user_input = DEFAULT_IMAGE_TOKEN+"\n"+args.user_prompt
+
+    conv.append_message(conv.roles[0], user_input)
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+    texts= []
     file_names=[]
-    texts=[]
-    image_tensors=[]
-    for path in tqdm(paths):
-        image = Image.open(path)
-
-        # Check if the image has an alpha (transparency) channel
-        if image.mode in ('RGBA', 'LA') or (image.mode == 'P' and 'transparency' in image.info):
-            # Create a new white background image
-            background = Image.new('RGB', image.size, (255, 255, 255))
-
-            # Paste the image onto the background using the alpha channel as a mask
-            background.paste(image, (0, 0), image)
-
-        # Similar operation in model_worker.py
-        image_tensor = process_images([image], image_processor, args)
-        image_tensors.append(image_tensor)
-
-    print(image_tensor.size())
-    image_tensor = torch.cat(image_tensors, 0)
-    print(image_tensor.size())
-    image_tensor = image_tensor.to(model.device, dtype=torch.float16)
-
-    # prompt = "このイラストを日本語でできる限り詳細に説明してください。表情や髪の色、目の色、耳の種類、服装、服の色など注意して説明してください。説明は反復を避けてください。"
-
-    input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
-    print("input_ids",input_ids,  input_ids.size())
-    # input_ids=input_ids.repeat(15,0)
-    # input_ids=torch.cat([input_ids,input_ids],0)
-    input_ids= torch.repeat_interleave(input_ids, repeats=image_tensor.size()[0], dim=0)
-    print("input_ids",input_ids,  input_ids.size())
-
-
+    dataset = LlavaCaptionDataset(prompt= prompt, paths = paths, tokenizer=tokenizer, image_processor=image_processor, )
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=2)
     with torch.inference_mode():
-        output_ids = model.generate(
-            input_ids,
-            images=image_tensor,
-            do_sample=True,
-            temperature=args.temperature,
-            max_new_tokens=args.max_new_tokens,
-        )
-    print("output_ids",output_ids.size())
-    for a in range(output_ids.size()[0]):
-        outputs = tokenizer.decode(output_ids[a, input_ids.shape[1]:]).strip()
-        print(outputs)
-        texts.append(outputs)
-        file_names.append(paths[a].split("/")[-1])
+        for i_batch, sample_batched in enumerate(tqdm(dataloader)):
+            print(i_batch, sample_batched['image_tensor'].size(), sample_batched['input_ids'].size())
+            output_ids = model.generate(
+                sample_batched['input_ids'].to("cuda"),
+                images=sample_batched['image_tensor'].to("cuda"),
+                do_sample=True,
+                temperature=args.temperature,
+                max_new_tokens=args.max_new_tokens
+            )
+            print("outputids",output_ids.size() , sample_batched['input_ids'].size(), output_ids[:,55:] )
+            outputs = tokenizer.batch_decode(output_ids[:,sample_batched['input_ids'].size()[1]: ],skip_special_tokens=True)#.strip()
+            outputs = [out.strip().replace("\n\n", "") for out in outputs]
+            # outputs = [out[: -len(stop_str)] if out.endswith(stop_str) else out for out in outputs]
+            texts.extend(outputs)
+            file_names.extend(sample_batched['path'])
+            # outputs = tokenizer.decode(output_ids[:, sample_batched['input_ids'].size()[1]:],skip_special_tokens=True).strip()
+            print("outputs", outputs)
+            # for a in range(output_ids.size()[0]):
+            #     outputs = tokenizer.decode(output_ids[a, sample_batched['input_ids'].size()[1]:],skip_special_tokens=True).strip()
+            #     texts.append(outputs)
+            #     file_names.append(os.path.basename( sample_batched['path'][a]))
 
-    if args.debug:
-        print("\n", {"outputs": outputs}, "\n")
-
-    pd.DataFrame({"file_name":file_names,"text":texts}).to_csv(args.output_csv,index=False)
+    results={"file_name":file_names,"text":texts}
+    pd.DataFrame(results).to_csv(args.output_csv,index=False)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -100,12 +261,12 @@ if __name__ == "__main__":
     parser.add_argument("--model-base", type=str, default=None)
     parser.add_argument("--image-folder", type=str, required=True)
     parser.add_argument("--output-csv", type=str, required=True)
-    # parser.add_argument("--system-prompt", type=str, required=True)
     parser.add_argument("--user-prompt", type=str, required=True)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--conv-mode", type=str, default=None)
     parser.add_argument("--temperature", type=float, default=0.2)
-    parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument("--max-new-tokens", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--load-8bit", action="store_true")
     parser.add_argument("--load-4bit", action="store_true")
     parser.add_argument("--debug", action="store_true")
@@ -114,11 +275,13 @@ if __name__ == "__main__":
     main(args)
 
 # python -m llava.serve.cli_batch --model-path liuhaotian/llava-v1.5-13b \ 
-# --load-8bit \
-# --system-prompt あなたは日本語を喋る人工知能です。誠実に画像をもとに日本語で応答を返してください。 \
+# --load-4bit \
 # --user-prompt このイラストを日本語でできる限り詳細に説明してください。表情や髪の色、目の色、耳の種類、服装、服の色 など注意して説明してください。説明は反復を避けてください。\
 #  --image-folder '/mnt/NVM/test'  \
 # --output-csv '/mnt/NVM/test/metadata.csv'
+# --batch-size 4
+
+
 
 
 # python -m llava.serve.cli_batch --model-path '/mnt/sabrent/llava-v1.5-7b' \ 
